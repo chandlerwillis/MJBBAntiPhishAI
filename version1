@@ -1,0 +1,314 @@
+import imaplib
+import email
+import os
+import re
+from pdf2image import convert_from_path
+from pyzbar.pyzbar import decode
+from PIL import Image
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+from selenium import webdriver
+from datetime import datetime
+import shutil
+
+# Your Gmail credentials and receiver's email address
+GMAIL_USERNAME = "E"  # Replace with your Gmail email address
+GMAIL_PASSWORD = "E"  # Replace with your Gmail password
+RECEIVER_EMAIL = "E"  # Replace with the receiver's email address
+
+# Variable to store the timestamp of the latest processed email
+latest_email_timestamp = None
+
+# List to store newly found QR code links
+new_qr_code_links = []
+
+# Function to send an email with the qr_code_links.txt file as an attachment
+def send_email_with_attachment(qr_code_links):
+    if not qr_code_links:
+        return  # Do not send an email if there are no QR codes
+
+    # Create an instance of MIMEMultipart
+    msg = MIMEMultipart()
+    msg['From'] = GMAIL_USERNAME
+    msg['To'] = RECEIVER_EMAIL
+    msg['Subject'] = 'QR Code Links'
+
+    # Add a text body to the email (optional)
+    body = 'QR Code links are attached.'
+    msg.attach(MIMEText(body, 'plain'))
+
+    # Attach the qr_code_links.txt file
+    with open('qr_code_links.txt', 'wb') as file:
+        file.write('\n'.join(qr_code_links).encode('utf-8'))
+    qr_code_links_attachment = MIMEApplication(open('qr_code_links.txt', 'rb').read())
+    qr_code_links_attachment.add_header('Content-Disposition', 'attachment', filename='qr_code_links.txt')
+    msg.attach(qr_code_links_attachment)
+
+    # Connect to Gmail SMTP server and send the email
+    server = smtplib.SMTP('smtp.gmail.com', 587)
+    server.starttls()
+    server.login(GMAIL_USERNAME, GMAIL_PASSWORD)
+    server.sendmail(GMAIL_USERNAME, RECEIVER_EMAIL, msg.as_string())
+    server.quit()
+
+# Function to download and process attachments
+def download_and_process_attachments():
+    global latest_email_timestamp
+    global new_qr_code_links
+
+    screenshot_dir = "screenshots"
+    attachment_dir = "attachments"
+    qr_code_links = []
+
+    mail = imaplib.IMAP4_SSL("imap.gmail.com")
+    mail.login(GMAIL_USERNAME, GMAIL_PASSWORD)
+    mail.select("inbox")
+    print("Connected to Gmail successfully.")
+
+    while True:
+        result, data = mail.search(None, "ALL")
+        email_ids = data[0].split()
+
+        if email_ids:
+            most_recent_email_id = email_ids[-1]
+            result, message_data = mail.fetch(most_recent_email_id, "(RFC822)")
+            raw_email = message_data[0][1]
+            email_message = email.message_from_bytes(raw_email)
+
+            # Parse the timestamp from the "Date" header
+            email_timestamp_str = email_message["Date"]
+            # Remove unwanted text like "(UTC)" from the timestamp
+            email_timestamp_str = re.sub(r'\(UTC\)', '', email_timestamp_str)
+            # Parse the timestamp
+            email_timestamp = datetime.strptime(email_timestamp_str.strip(), "%a, %d %b %Y %H:%M:%S %z")
+
+            if latest_email_timestamp is None or email_timestamp > latest_email_timestamp:
+                latest_email_timestamp = email_timestamp
+
+                # Create directories to store attachments and screenshots
+                os.makedirs(attachment_dir, exist_ok=True)
+                os.makedirs(screenshot_dir, exist_ok=True)
+
+                # Process attachments
+                for part in email_message.walk():
+                    content_type = part.get_content_type()
+                    if "image" in content_type:
+                        image_filename = part.get_filename()
+                        image_path = os.path.join(attachment_dir, image_filename)
+                        with open(image_path, "wb") as file:
+                            file.write(part.get_payload(decode=True))
+                        print(f"Image attachment downloaded and saved to {image_path}")
+                        scan_image_for_qr_code(image_path, qr_code_links)
+
+                # Process PDF attachment if present
+                for part in email_message.walk():
+                    if part.get_content_disposition() and part.get_filename().endswith(".pdf"):
+                        pdf_attachment = part
+                        pdf_attachment_path = os.path.join(attachment_dir, part.get_filename())
+                        with open(pdf_attachment_path, "wb") as file:
+                            file.write(part.get_payload(decode=True))
+                        print(f"PDF attachment downloaded and saved to {pdf_attachment_path}")
+                        pdf_images = convert_from_path(pdf_attachment_path)
+                        for i, pdf_image in enumerate(pdf_images):
+                            pdf_image_path = os.path.join(attachment_dir, f"{os.path.splitext(part.get_filename())[0]}_page_{i + 1}.png")
+                            pdf_image.save(pdf_image_path, "PNG")
+                            print(f"Converted PDF page {i + 1} to image: {pdf_image_path}")
+                            scan_image_for_qr_code(pdf_image_path, qr_code_links)
+
+                # Parse links in the email body and navigate to websites
+                email_body = get_email_body(email_message)
+                urls = extract_urls_from_text(email_body)
+                navigate_and_screenshot_links(urls, screenshot_dir, qr_code_links)
+
+                # Scan all images in the current directory for QR codes
+                scan_images_in_directory(attachment_dir, qr_code_links)
+
+                # Scan all images in the screenshots directory for QR codes
+                scan_images_in_directory(screenshot_dir, qr_code_links)
+
+                # Check if there are new QR code links
+                new_links = set(qr_code_links) - set(new_qr_code_links)
+                if new_links:
+                    new_qr_code_links.extend(new_links)
+                    # Send the qr_code_links.txt file as an email attachment if there are new QR code links
+                    send_email_with_attachment(new_links)
+
+                # Clean up the directories
+                cleanup_directories(attachment_dir, screenshot_dir)
+
+# Function to get the email body text
+def get_email_body(email_message):
+    email_body = ""
+    for part in email_message.walk():
+        if part.get_content_type() == "text/plain":
+            email_body = part.get_payload(decode=True).decode("utf-8")
+    return email_body
+
+# Function to scan all images in a directory for QR codes and add the URLs to qr_code_links
+def scan_images_in_directory(directory, qr_code_links):
+    for filename in os.listdir(directory):
+        if filename.lower().endswith((".jpg", ".jpeg", ".png")):
+            image_path = os.path.join(directory, filename)
+            scan_image_for_qr_code(image_path, qr_code_links)
+
+# Function to extract URLs from text
+def extract_urls_from_text(text):
+    url_pattern = re.compile(r"https?://\S+")
+    urls = url_pattern.findall(text)
+    return urls
+
+# Function to navigate to URLs and take full-page screenshots
+def navigate_and_screenshot_links(urls, screenshot_dir, qr_code_links):
+    chrome_options = webdriver.ChromeOptions()
+    chrome_options.add_argument('--headless')
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--disable-gpu')  # Disable GPU acceleration
+    chrome_options.add_argument('--disable-software-rasterizer')  # Disable software rendering
+
+    # Initialize the WebDriver with Chrome
+    driver = webdriver.Chrome(options=chrome_options)
+
+    for url in urls:
+        final_url = follow_redirects(url)
+        screenshots = take_fullpage_screenshot(driver, final_url, screenshot_dir)
+        for screenshot in screenshots:
+            print(f"Full-page screenshot of {final_url} saved to {screenshot}")
+            scan_image_for_qr_code(screenshot, qr_code_links)
+
+    # Close the WebDriver
+    driver.quit()
+
+# Function to follow redirects and get the final URL
+def follow_redirects(initial_url):
+    try:
+        response = webdriver.Chrome().get(initial_url, allow_redirects=True)
+        return response.url
+    except Exception as e:
+        print(f"Error while following redirects for URL {initial_url}: {str(e)}")
+        return initial_url
+
+# Function to scan a single image for QR codes and add the URLs to qr_code_links
+def scan_image_for_qr_code(image_path, qr_code_links):
+    image = Image.open(image_path)
+    decoded_objects = decode(image)
+    if decoded_objects:
+        print(f"QR Code Links in {image_path}:")
+        for obj in decoded_objects:
+            data = obj.data.decode('utf-8')
+            print(f"URL: {data}")
+            qr_code_links.append(data)
+
+# Function to take a full-page screenshot of a webpage
+def take_fullpage_screenshot(driver, url, save_dir):
+    # Generate a suitable filename from the URL
+    filename = re.sub(r'[^a-zA-Z0-9]', '_', url) + ".png"
+    screenshot_path = os.path.join(save_dir, filename)
+
+    # Set window size to capture the full page
+    driver.set_window_size(1920, 1080)  # Adjust the resolution as needed
+
+    # Navigate to the specified URL
+    driver.get(url)
+
+    # Scroll down the page to load all content
+    last_height = driver.execute_script("return document.body.scrollHeight")
+    while True:
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        new_height = driver.execute_script("return document.body.scrollHeight")
+        if new_height == last_height:
+            break
+        last_height = new_height
+
+    # Get the total page height
+    total_height = driver.execute_script("return document.body.scrollHeight")
+
+    # Initialize variables for screenshot capture
+    screenshots = []
+    viewport_height = driver.execute_script("return window.innerHeight")
+    num_screenshots = total_height // viewport_height + 1
+
+    # Capture individual screenshots and scroll
+    for i in range(num_screenshots):
+        screenshot_path = os.path.join(save_dir, f"{filename}_part_{i + 1}.png")
+        driver.save_screenshot(screenshot_path)
+        screenshots.append(screenshot_path)
+        driver.execute_script(f"window.scrollTo(0, {viewport_height * (i + 1)});")
+
+    return screenshots
+
+# Function to clean up the directories by deleting all files
+def cleanup_directories(attachment_dir, screenshot_dir):
+    # Remove all files in the attachment directory
+    for filename in os.listdir(attachment_dir):
+        file_path = os.path.join(attachment_dir, filename)
+        try:
+            if os.path.isfile(file_path):
+                os.unlink(file_path)
+        except Exception as e:
+            print(f"Error deleting file {file_path}: {str(e)}")
+
+    # Remove all files in the screenshot directory
+    for filename in os.listdir(screenshot_dir):
+        file_path = os.path.join(screenshot_dir, filename)
+        try:
+            if os.path.isfile(file_path):
+                os.unlink(file_path)
+        except Exception as e:
+            print(f"Error deleting file {file_path}: {str(e)}")
+
+# Function to display the QR code log
+def display_qr_code_log(qr_code_links):
+    print("Recent QR Code Links:")
+    for i, link in enumerate(qr_code_links):
+        print(f"{i + 1}. {link}")
+
+if __name__ == "__main__":
+    while True:
+      print("")
+      ascii_art = """
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣤⣴⣶⣾⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣤⣶⣿⣿⣿⣿⣿⣿⣿⣿⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⢀⣠⣾⣿⣿⣿⣿⣿⣿⣿⣿⠿⠿⠿⠛⠓⣶⣶⢶⣶⣶⣶⣶⠶⣤⣄⡀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⢀⣴⣿⣿⣿⣿⡿⠟⠋⢉⣁⣠⣤⣴⡶⠀⡴⣿⣿⣿⣿⣿⣿⡏⣙⣿⡷⠋⢉⠓⢦⣄⠀⠀
+⠀⠀⠀⠀⣴⣿⣿⣿⠿⠋⣁⣤⣶⣿⣿⣿⣿⣿⠏⠀⣼⣽⣿⣿⣿⡿⠿⠿⣿⣿⠏⡠⠚⣡⣶⣶⣾⣿⠀
+⠀⠀⢀⣾⣿⣿⠟⣡⣶⣿⠿⠛⠁⠀⠘⣿⣿⡟⠀⢸⣧⣿⡟⠉⠀⠀⠀⠀⠀⠀⡜⢀⣾⣿⣿⣿⣿⠟⠀
+⠀⢀⣿⣿⡟⣡⣾⣿⣟⣥⡶⠒⠊⢉⣡⢿⣿⣧⠀⢸⣿⠏⠀⠀⠀⠀⠀⠀⠀⠈⢀⣾⡿⠿⠿⠿⠯⢤⡄
+⢀⣿⣿⡟⣼⣿⠟⠹⣿⣏⠀⠠⠒⣉⠔⣫⠽⡿⣆⠈⣯⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⣀⣤⠖⠒⠒⡂⢠⡇
+⢸⣿⡟⣸⣿⠏⠀⠀⠘⢿⣷⡀⠈⠤⠊⢁⡼⠁⣈⣷⣾⣷⣄⠀⠀⠐⠢⢴⣶⡶⠯⢷⡫⢔⣥⣮⠾⠋⠀
+⣿⣿⡇⣿⡟⠀⠀⠀⠀⠀⠙⠻⢷⣦⡶⣿⣷⣿⣿⣿⣿⣿⣿⠿⠿⠖⠒⠒⠒⠒⠚⠛⠋⠉⠉⠀⠀⠀⠀
+⢻⣿⠸⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⢀⣾⣿⣿⣿⡿⠛⠉⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠘⣿⠀⣿⣇⠀⠀⠀⠀⠀⠀⠀⠀⣾⣿⣿⡟⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠹⣇⠸⣿⡀⠀⠀⠀⠀⠀⠀⠘⣿⣿⢿⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⣤⡀⠀⠀⠀⠀
+⠀⢈⠉⠉⠈⣿⠀⠀⠀⠀⠀⠀⠀⢻⣿⠘⢷⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣾⣿⣿⣿⣿⠟⠀⠀
+⣾⠀⠀⢸⣿⣇⠀⠀⠀⠀⠀⠀⠀⠀⠹⣆⠀⠙⠷⣤⣀⠀⠀⠀⠀⠀⠀⠀⠀⣠⡶⠋⡀⠀⢿⠀⠀⠀⠀
+⢻⣿⠀⠀⢸⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⣾⣿⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠘⣿⠀⠀⠀⣿⣇⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠹⣆⢀⣴⣿⡀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠀⠀⠀⠀⠉⠛⠶⢤⣤⣤⡴⠖⠋⣁⣤⠞⢀⠀⡿⠀⠀⠀⠀
+⠀⠀⠈⠛⢮⣷⣤⠀⠀⠀⠀⠀⠀⠀⠀⠈⠀⠀⠀⠀⠀⠀⠈⠉⠻⣟⣛⣩⣥⠖⠁⢰⠇⠀⠀⠀⠀
+⠀⠀⠀⠀⠈⠙⠳⢦⣤⣀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⠻⢦⣘⠻⣷⣤⣄⣀⠀⠈⢷⡀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⡔⢫⣿⡟⡟⠛⠶⠶⠦⠤⠤⣤⣤⣤⣤⣤⣤⣤⣤⣼⠿⠯⠭⠤⠔⠊⣿⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠛⠷⣬⣿⡾⠃⠀⠀⠀⠀⠀⠀⠀⠻⣦⡀⠹⣯⡻⠶⠦⠤⠤⠄⢿⡀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠻⢦⣘⠻⣷⣤⣄⣀⠀⠈⢷⡀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠓⠶⣬⣉⣉⠉⠀⢀⣿⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠉⠉⠉⠁⠀⠀⠀
+"""
+
+      print(ascii_art)
+      print("I usually say 'Morning.' instead of 'Good morning',")
+      print("because if it was a good morning, I'd be phishing.")
+      print("")
+      print("Options:")
+      print("1. Start the script and run it as normal.")
+      print("2. View the recently found QR codes in a log.")
+      choice = input("Enter your choice (1/2): ")
+
+      if choice == "1":
+          download_and_process_attachments()
+      elif choice == "2":
+            # Display the QR code log
+          display_qr_code_log(new_qr_code_links)
+      else:
+          print("Invalid choice. Please enter 1 or 2.")
